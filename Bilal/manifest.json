@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Bilal - Icons8 Link Copier",
+  "short_name": "Bilal",
+  "version": "1.0.1",
+  "description": "Select icons on Icons8 and copy all their links at once, ready to paste into the Icons8 to SVG converter.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Copy selected Icons8 links",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
+  },
+  "permissions": ["storage", "clipboardWrite"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://icons8.com/*", "https://www.icons8.com/*"],
+      "js": ["page-bridge.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://icons8.com/*", "https://www.icons8.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "copy-selected-links": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Copy links of the selected Icons8 icons"
+    }
+  }
+}

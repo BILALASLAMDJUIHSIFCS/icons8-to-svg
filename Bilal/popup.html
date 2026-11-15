@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Bilal — Icons8 Link Copier</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="popup__header">
+        <img src="icons/icon-32.png" width="28" height="28" alt="" />
+        <div>
+          <h1>Icons8 Link Copier</h1>
+          <p id="status" class="popup__status" aria-live="polite">Checking this tab…</p>
+        </div>
+      </header>
+
+      <label for="links" class="popup__label">Selected links</label>
+      <textarea id="links" rows="6" readonly spellcheck="false" placeholder="Select icons on icons8.com — their links show up here."></textarea>
+
+      <div class="popup__actions">
+        <button id="copy" type="button" class="btn btn--primary" disabled>Copy links</button>
+        <button id="open" type="button" class="btn btn--ghost" disabled>Open in converter</button>
+      </div>
+
+      <form id="settings" class="popup__settings">
+        <label for="converter" class="popup__label">Converter app URL</label>
+        <div class="popup__row">
+          <input id="converter" type="url" placeholder="https://your-converter.vercel.app" autocomplete="off" spellcheck="false" />
+          <button type="submit" class="btn btn--ghost">Save</button>
+        </div>
+        <p class="popup__hint">Shortcut on Icons8: <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> copies all selected links.</p>
+      </form>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

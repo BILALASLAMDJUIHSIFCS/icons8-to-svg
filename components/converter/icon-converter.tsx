@@ -1,128 +1,242 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { Copy, Check } from 'lucide-react'
+import { Check, Copy } from 'lucide-react'
+import { combineSvgsForFigma, downloadSvgZip } from '@/lib/batch-export'
 import { copySvgForFigma, downloadSvg } from '@/lib/clipboard'
+import { linkKey, MAX_LINKS } from '@/lib/links'
 import { traceImage } from '@/lib/trace/trace-image'
+import { BatchToolbar } from './batch-toolbar'
 import { LinkInput } from './link-input'
-import { PreviewStage, type Stage } from './preview-stage'
-import { ResultActions } from './result-actions'
+import { ResultCard, type ConvertItem } from './result-card'
 
-type Result = { svg: string; svgUrl: string; colors: number }
+// Tracing is CPU-heavy (one worker per icon), so a small pool keeps the tab responsive.
+const CONCURRENCY = 3
 
-function formatBytes(bytes: number) {
-  return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
+function nameFromLink(link: string) {
+  const parts = new URL(link).pathname.split('/').filter(Boolean)
+  return parts.at(-1)?.replace(/\.[a-z]+$/i, '') || 'icon'
 }
 
-export function IconConverter() {
-  const [stage, setStage] = useState<Stage>('idle')
-  const [progress, setProgress] = useState(0)
-  const [name, setName] = useState('icon')
-  const [pngUrl, setPngUrl] = useState<string | null>(null)
-  const [result, setResult] = useState<Result | null>(null)
+export function IconConverter({ initialLinks = [] }: { initialLinks?: string[] }) {
+  const [items, setItems] = useState<ConvertItem[]>([])
   const [message, setMessage] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
-  const abortRef = useRef<AbortController | null>(null)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const pendingRef = useRef<ConvertItem[]>([])
+  const activeRef = useRef(0)
+  const controllersRef = useRef(new Map<string, AbortController>())
+  const objectUrlsRef = useRef(new Map<string, string[]>())
 
-  useEffect(() => () => (pngUrl ? URL.revokeObjectURL(pngUrl) : undefined), [pngUrl])
-  useEffect(() => () => (result ? URL.revokeObjectURL(result.svgUrl) : undefined), [result])
+  const patch = (key: string, update: Partial<ConvertItem>) =>
+    setItems((prev) => prev.map((item) => (item.key === key ? { ...item, ...update } : item)))
 
-  const convert = async (link: string) => {
-    abortRef.current?.abort()
+  const trackUrl = (key: string, url: string) => {
+    objectUrlsRef.current.set(key, [...(objectUrlsRef.current.get(key) ?? []), url])
+    return url
+  }
+
+  const releaseUrls = (key: string) => {
+    objectUrlsRef.current.get(key)?.forEach((url) => URL.revokeObjectURL(url))
+    objectUrlsRef.current.delete(key)
+  }
+
+  const convertOne = async (item: ConvertItem) => {
     const controller = new AbortController()
-    abortRef.current = controller
-
-    setMessage(null)
-    setCopied(false)
-    setResult(null)
-    setProgress(0)
-    setStage('fetching')
+    controllersRef.current.set(item.key, controller)
+    patch(item.key, { status: 'fetching', progress: 0, error: undefined })
 
     try {
-      const res = await fetch(`/api/icon?url=${encodeURIComponent(link)}`, { signal: controller.signal })
+      const res = await fetch(`/api/icon?url=${encodeURIComponent(item.link)}`, { signal: controller.signal })
       if (!res.ok) {
         const body = await res.json().catch(() => null)
         throw new Error(body?.error ?? 'Could not download that icon.')
       }
       const png = await res.blob()
-      const iconName = res.headers.get('X-Icon-Name') ?? 'icon'
-      setName(iconName)
-      setPngUrl(URL.createObjectURL(png))
-      setStage('tracing')
+      const name = res.headers.get('X-Icon-Name') ?? item.name
+      patch(item.key, { status: 'tracing', name, pngUrl: trackUrl(item.key, URL.createObjectURL(png)) })
 
-      const { svg, colors } = await traceImage(png, setProgress, controller.signal)
+      const { svg, colors } = await traceImage(png, (progress) => patch(item.key, { progress }), controller.signal)
       if (colors === 0) throw new Error('No visible shapes found in that icon.')
-      setResult({ svg, colors, svgUrl: URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })) })
-      setStage('ready')
+      const svgUrl = trackUrl(item.key, URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })))
+      patch(item.key, { status: 'ready', svg, colors, svgUrl, progress: 1 })
     } catch (error) {
       if ((error as Error).name === 'AbortError') return
-      setStage('error')
-      setMessage((error as Error).message)
+      patch(item.key, { status: 'error', error: (error as Error).message })
+    } finally {
+      controllersRef.current.delete(item.key)
     }
   }
 
-  const copy = async () => {
-    if (!result) return
+  const pump = () => {
+    while (activeRef.current < CONCURRENCY && pendingRef.current.length) {
+      const next = pendingRef.current.shift()!
+      activeRef.current += 1
+      convertOne(next).finally(() => {
+        activeRef.current -= 1
+        pump()
+      })
+    }
+  }
+
+  const enqueue = (links: string[]) => {
+    setMessage(null)
+    const existing = new Set(items.map((item) => item.key))
+    const fresh: ConvertItem[] = []
+    for (const link of links) {
+      const key = linkKey(link)
+      if (existing.has(key)) continue
+      existing.add(key)
+      fresh.push({ key, link, status: 'queued', progress: 0, name: nameFromLink(link) })
+    }
+
+    const room = Math.max(0, MAX_LINKS - items.length)
+    const accepted = fresh.slice(0, room)
+    if (fresh.length > accepted.length) setMessage(`Only ${MAX_LINKS} icons at a time — extra links were skipped.`)
+    else if (!fresh.length) setMessage('Those icons are already in the list.')
+    if (!accepted.length) return
+
+    setItems((prev) => [...prev, ...accepted])
+    pendingRef.current.push(...accepted)
+    pump()
+  }
+
+  const remove = (key: string) => {
+    controllersRef.current.get(key)?.abort()
+    pendingRef.current = pendingRef.current.filter((item) => item.key !== key)
+    releaseUrls(key)
+    setItems((prev) => prev.filter((item) => item.key !== key))
+  }
+
+  const clearAll = () => {
+    controllersRef.current.forEach((controller) => controller.abort())
+    pendingRef.current = []
+    objectUrlsRef.current.forEach((_, key) => releaseUrls(key))
+    setItems([])
+    setMessage(null)
+  }
+
+  const retry = (item: ConvertItem) => {
+    releaseUrls(item.key)
+    patch(item.key, { status: 'queued', progress: 0, error: undefined, pngUrl: undefined, svgUrl: undefined, svg: undefined })
+    pendingRef.current.push(item)
+    pump()
+  }
+
+  const flashCopied = (key: string) => {
+    setCopiedKey(key)
+    setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 2500)
+  }
+
+  const readyItems = items.filter((item): item is ConvertItem & { svg: string } => item.status === 'ready' && !!item.svg)
+
+  const copyOne = async (item: ConvertItem) => {
+    if (!item.svg) return
     try {
-      await copySvgForFigma(result.svg)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2500)
+      await copySvgForFigma(item.svg)
+      flashCopied(item.key)
     } catch (error) {
       setMessage((error as Error).message)
     }
   }
 
-  const busy = stage === 'fetching' || stage === 'tracing'
-  const ready = stage === 'ready' && !!result
+  const copyAll = async () => {
+    if (!readyItems.length) return
+    try {
+      const svg = readyItems.length === 1 ? readyItems[0].svg : combineSvgsForFigma(readyItems)
+      await copySvgForFigma(svg)
+      flashCopied('all')
+    } catch (error) {
+      setMessage((error as Error).message)
+    }
+  }
+
+  useEffect(() => {
+    if (!initialLinks.length) return
+    // Deferred so React's dev double-mount doesn't start (and then abort) the batch twice.
+    const timer = setTimeout(() => {
+      enqueue(initialLinks)
+      window.history.replaceState(null, '', window.location.pathname)
+    }, 0)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const controllers = controllersRef.current
+    const urls = objectUrlsRef.current
+    return () => {
+      controllers.forEach((controller) => controller.abort())
+      urls.forEach((list) => list.forEach((url) => URL.revokeObjectURL(url)))
+    }
+  }, [])
+
+  const working = items.filter((item) => item.status === 'queued' || item.status === 'fetching' || item.status === 'tracing').length
+  const failed = items.filter((item) => item.status === 'error').length
+  const copiedAll = copiedKey === 'all'
 
   return (
     <section aria-label="Icons8 to SVG converter" className="flex flex-col gap-6">
-      {/* ── Top bar: input + Figma copy button ── */}
       <div className="flex flex-col gap-3 md:flex-row md:items-end">
         <div className="flex-1">
-          <LinkInput busy={busy} onSubmit={convert} onError={setMessage} />
+          <LinkInput onSubmit={enqueue} onError={setMessage} />
         </div>
         <button
           type="button"
-          disabled={!ready}
-          onClick={copy}
-          className="inline-flex h-[52px] items-center justify-center gap-2 rounded-xl border border-primary/20 bg-primary/5 px-5 font-medium text-primary transition-all hover:bg-primary/10 disabled:pointer-events-none disabled:opacity-40 md:h-[52px] md:shrink-0"
+          disabled={!readyItems.length}
+          onClick={copyAll}
+          className="inline-flex h-13 items-center justify-center gap-2 rounded-xl border border-primary/20 bg-primary/5 px-5 font-medium text-primary transition-all hover:bg-primary/10 disabled:pointer-events-none disabled:opacity-40 md:shrink-0"
         >
-          {copied ? <Check className="size-4" aria-hidden="true" /> : <Copy className="size-4" aria-hidden="true" />}
-          {copied ? 'Copied — Ctrl+V in Figma' : 'Copy for Figma'}
+          {copiedAll ? <Check className="size-4" aria-hidden="true" /> : <Copy className="size-4" aria-hidden="true" />}
+          {copiedAll
+            ? 'Copied — Ctrl+V in Figma'
+            : readyItems.length > 1
+              ? `Copy all ${readyItems.length} for Figma`
+              : 'Copy for Figma'}
         </button>
       </div>
 
-      {/* ── Desktop: side-by-side preview + actions | Mobile: stacked ── */}
-      <div className="grid grid-cols-1 gap-6 md:grid-cols-[1fr_280px]">
-        <PreviewStage
-          stage={stage}
-          progress={progress}
-          pngUrl={pngUrl}
-          svgUrl={result?.svgUrl ?? null}
-          name={name}
-        />
+      <p aria-live="polite" className={message ? 'text-sm text-destructive' : 'sr-only'}>
+        {message}
+      </p>
 
+      {items.length ? (
         <div className="flex flex-col gap-4">
-          <ResultActions
-            ready={ready}
-            copied={copied}
-            onDownload={() => result && downloadSvg(result.svg, name)}
-            onCopy={copy}
+          <BatchToolbar
+            total={items.length}
+            ready={readyItems.length}
+            working={working}
+            failed={failed}
+            onDownloadAll={() =>
+              readyItems.length === 1
+                ? downloadSvg(readyItems[0].svg, readyItems[0].name)
+                : downloadSvgZip(readyItems)
+            }
+            onClear={clearAll}
           />
-
-          {/* ── Info / error strip ── */}
-          <p
-            aria-live="polite"
-            className={message ? 'text-sm text-destructive' : 'font-mono text-xs text-muted-foreground'}
-          >
-            {message ??
-              (result
-                ? `${result.colors} color ${result.colors === 1 ? 'layer' : 'layers'} · ${formatBytes(new Blob([result.svg]).size)} · traced from 1100px PNG`
-                : '\u00a0')}
+          <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+            {items.map((item) => (
+              <ResultCard
+                key={item.key}
+                item={item}
+                copied={copiedKey === item.key}
+                onCopy={() => copyOne(item)}
+                onDownload={() => item.svg && downloadSvg(item.svg, item.name)}
+                onRetry={() => retry(item)}
+                onRemove={() => remove(item.key)}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-border bg-card/60 px-6 py-16 text-center">
+          <p className="font-medium text-foreground">Your vectors show up here.</p>
+          <p className="max-w-md text-sm leading-relaxed text-muted-foreground text-pretty">
+            Paste one link or a whole list. Using the Bilal extension? Select icons on Icons8, press{' '}
+            <span className="font-medium text-foreground">Copy links</span>, then paste here — every icon converts at
+            once.
           </p>
         </div>
-      </div>
+      )}
     </section>
   )
 }
